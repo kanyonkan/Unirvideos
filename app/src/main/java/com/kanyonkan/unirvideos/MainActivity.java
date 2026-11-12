@@ -16,6 +16,8 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.ParcelFileDescriptor;
 import android.provider.MediaStore;
 import android.provider.OpenableColumns;
@@ -23,15 +25,35 @@ import android.view.Gravity;
 import android.view.View;
 import android.view.WindowManager;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
+import androidx.media3.common.Effect;
+import androidx.media3.common.MediaItem;
+import androidx.media3.common.MimeTypes;
+import androidx.media3.common.audio.AudioProcessor;
+import androidx.media3.effect.Presentation;
+import androidx.media3.transformer.Composition;
+import androidx.media3.transformer.EditedMediaItem;
+import androidx.media3.transformer.EditedMediaItemSequence;
+import androidx.media3.transformer.Effects;
+import androidx.media3.transformer.ExportException;
+import androidx.media3.transformer.ExportResult;
+import androidx.media3.transformer.ProgressHolder;
+import androidx.media3.transformer.Transformer;
+
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.nio.ByteBuffer;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
@@ -39,16 +61,23 @@ import java.util.Locale;
 public class MainActivity extends Activity {
 
     private static final int REQ_PICK = 1;
+    private static final String OK_MSG = "Concluído! Salvo em Filmes/UnirVideos.";
 
     private final List<Uri> uris = new ArrayList<>();
     private final List<String> names = new ArrayList<>();
 
     private LinearLayout listBox;
     private Button btnAdd, btnMerge, btnOpen;
+    private CheckBox chkReencode;
     private ProgressBar bar;
     private TextView status;
     private Uri resultUri;
     private volatile boolean working = false;
+
+    private final Handler handler = new Handler(Looper.getMainLooper());
+    private final ProgressHolder progressHolder = new ProgressHolder();
+    private Transformer transformer;
+    private boolean exporting = false;
 
     @Override
     protected void onCreate(Bundle b) {
@@ -65,7 +94,7 @@ public class MainActivity extends Activity {
         root.addView(title);
 
         TextView hint = new TextView(this);
-        hint.setText("Os vídeos devem ter o mesmo codec e a mesma resolução. A união é feita sem recodificar (rápida e sem perda de qualidade).");
+        hint.setText("Padrão: união rápida e sem perda de qualidade (vídeos com mesmo codec e mesma resolução). Para resoluções diferentes, marque \"Recodificar\".");
         hint.setTextSize(13);
         hint.setPadding(0, dp(6), 0, dp(10));
         root.addView(hint);
@@ -80,6 +109,10 @@ public class MainActivity extends Activity {
         listBox.setOrientation(LinearLayout.VERTICAL);
         sv.addView(listBox);
         root.addView(sv, new LinearLayout.LayoutParams(-1, 0, 1f));
+
+        chkReencode = new CheckBox(this);
+        chkReencode.setText("Recodificar (aceita resoluções diferentes; mais lento)");
+        root.addView(chkReencode);
 
         bar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
         bar.setMax(1000);
@@ -112,6 +145,18 @@ public class MainActivity extends Activity {
 
         setContentView(root);
         refreshList();
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        handler.removeCallbacksAndMessages(null);
+        if (exporting && transformer != null) {
+            try {
+                transformer.cancel();
+            } catch (Exception ignored) {
+            }
+        }
     }
 
     private int dp(int v) {
@@ -180,6 +225,7 @@ public class MainActivity extends Activity {
         }
         btnMerge.setEnabled(uris.size() >= 2 && !working);
         btnAdd.setEnabled(!working);
+        chkReencode.setEnabled(!working);
         if (uris.size() < 2 && !working) status.setText("Adicione pelo menos 2 vídeos.");
     }
 
@@ -211,33 +257,226 @@ public class MainActivity extends Activity {
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         refreshList();
         final List<Uri> in = new ArrayList<>(uris);
+
+        if (chkReencode.isChecked()) {
+            startReencode(in);
+            return;
+        }
+
         new Thread(() -> {
             String msg;
             try {
                 merge(in);
-                msg = "Concluído! Salvo em Filmes/UnirVideos.";
+                msg = OK_MSG;
             } catch (Exception e) {
                 resultUri = null;
                 msg = "Erro: " + e.getMessage();
             }
-            final String m = msg;
-            runOnUiThread(() -> {
-                working = false;
-                getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-                status.setText(m);
-                if (resultUri != null) btnOpen.setVisibility(View.VISIBLE);
-                refreshList();
-                status.setText(m);
-            });
+            finishWork(msg);
         }).start();
     }
 
-    private void progress(float f, String text) {
+    private void finishWork(final String msg) {
+        runOnUiThread(() -> {
+            working = false;
+            getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+            refreshList();
+            status.setText(msg);
+            if (resultUri != null) btnOpen.setVisibility(View.VISIBLE);
+        });
+    }
+
+    private void progress(final float f, final String text) {
         runOnUiThread(() -> {
             bar.setProgress((int) (f * 1000));
             status.setText(text);
         });
     }
+
+    // ------------------------------------------------------------------
+    // Modo 2: recodificação (aceita resoluções diferentes) - Media3 Transformer
+    // ------------------------------------------------------------------
+
+    private void startReencode(final List<Uri> in) {
+        progress(0f, "Preparando...");
+        new Thread(() -> {
+            try {
+                final int[] size = targetSize(in.get(0));
+                runOnUiThread(() -> exportComposition(in, size[0], size[1]));
+            } catch (Exception e) {
+                resultUri = null;
+                finishWork("Erro: " + e.getMessage());
+            }
+        }).start();
+    }
+
+    /** Tamanho (como exibido) do primeiro vídeo, com valores pares. */
+    private int[] targetSize(Uri u) throws Exception {
+        MediaMetadataRetriever mr = new MediaMetadataRetriever();
+        try {
+            mr.setDataSource(this, u);
+            int w = Integer.parseInt(mr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH));
+            int h = Integer.parseInt(mr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT));
+            String r = mr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION);
+            int rot = r == null ? 0 : Integer.parseInt(r);
+            if (rot == 90 || rot == 270) {
+                int t = w;
+                w = h;
+                h = t;
+            }
+            w -= w % 2;
+            h -= h % 2;
+            return new int[]{w, h};
+        } catch (Exception e) {
+            throw new Exception("não foi possível ler o tamanho do primeiro vídeo");
+        } finally {
+            mr.release();
+        }
+    }
+
+    private void exportComposition(List<Uri> in, int w, int h) {
+        try {
+            final File tmp = new File(getCacheDir(), "unido_tmp.mp4");
+            if (tmp.exists()) tmp.delete();
+
+            List<EditedMediaItem> items = new ArrayList<>();
+            for (Uri u : in) {
+                // Escala para caber no tamanho final, com faixas pretas se a proporção for diferente.
+                Presentation p = Presentation.createForWidthAndHeight(w, h, Presentation.LAYOUT_SCALE_TO_FIT);
+                Effects fx = new Effects(
+                        Collections.<AudioProcessor>emptyList(),
+                        Collections.<Effect>singletonList(p));
+                items.add(new EditedMediaItem.Builder(MediaItem.fromUri(u)).setEffects(fx).build());
+            }
+            EditedMediaItemSequence seq = new EditedMediaItemSequence(items);
+            Composition comp = new Composition.Builder(Collections.singletonList(seq)).build();
+
+            transformer = new Transformer.Builder(this)
+                    .setVideoMimeType(MimeTypes.VIDEO_H264)
+                    .setAudioMimeType(MimeTypes.AUDIO_AAC)
+                    .addListener(new Transformer.Listener() {
+                        @Override
+                        public void onCompleted(Composition composition, ExportResult exportResult) {
+                            exporting = false;
+                            handler.removeCallbacksAndMessages(null);
+                            progress(1f, "Salvando na galeria...");
+                            saveAsync(tmp);
+                        }
+
+                        @Override
+                        public void onError(Composition composition, ExportResult exportResult,
+                                            ExportException exportException) {
+                            exporting = false;
+                            handler.removeCallbacksAndMessages(null);
+                            tmp.delete();
+                            resultUri = null;
+                            finishWork("Erro ao recodificar: " + exportException.getMessage());
+                        }
+                    })
+                    .build();
+
+            exporting = true;
+            transformer.start(comp, tmp.getAbsolutePath());
+            pollProgress();
+        } catch (Exception e) {
+            exporting = false;
+            resultUri = null;
+            finishWork("Erro: " + e.getMessage());
+        }
+    }
+
+    private void pollProgress() {
+        if (!exporting || transformer == null) return;
+        int st = transformer.getProgress(progressHolder);
+        if (st == Transformer.PROGRESS_STATE_AVAILABLE) {
+            progress(progressHolder.progress / 100f, "Recodificando... " + progressHolder.progress + "%");
+        } else {
+            status.setText("Recodificando...");
+        }
+        handler.postDelayed(this::pollProgress, 500);
+    }
+
+    private void saveAsync(final File tmp) {
+        new Thread(() -> {
+            String msg;
+            try {
+                resultUri = saveFileToMovies(tmp);
+                msg = OK_MSG;
+            } catch (Exception e) {
+                resultUri = null;
+                msg = "Erro ao salvar: " + e.getMessage();
+            } finally {
+                tmp.delete();
+            }
+            finishWork(msg);
+        }).start();
+    }
+
+    private String newName() {
+        return "Unido_" + new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date()) + ".mp4";
+    }
+
+    /** Copia um arquivo local para Filmes/UnirVideos. */
+    private Uri saveFileToMovies(File src) throws Exception {
+        ContentResolver cr = getContentResolver();
+        String fileName = newName();
+        Uri outUri;
+        OutputStream os;
+        if (Build.VERSION.SDK_INT >= 29) {
+            ContentValues v = new ContentValues();
+            v.put(MediaStore.Video.Media.DISPLAY_NAME, fileName);
+            v.put(MediaStore.Video.Media.MIME_TYPE, "video/mp4");
+            v.put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/UnirVideos");
+            v.put(MediaStore.Video.Media.IS_PENDING, 1);
+            outUri = cr.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, v);
+            if (outUri == null) throw new Exception("não foi possível criar o arquivo de saída");
+            os = cr.openOutputStream(outUri);
+            if (os == null) throw new Exception("não foi possível gravar o arquivo de saída");
+        } else {
+            File dir = getExternalFilesDir(Environment.DIRECTORY_MOVIES);
+            if (dir == null) throw new Exception("armazenamento indisponível");
+            dir.mkdirs();
+            File f = new File(dir, fileName);
+            outUri = Uri.fromFile(f);
+            os = new FileOutputStream(f);
+        }
+
+        boolean ok = false;
+        try (InputStream is = new FileInputStream(src)) {
+            byte[] buf = new byte[1 << 16];
+            int n;
+            while ((n = is.read(buf)) > 0) os.write(buf, 0, n);
+            os.flush();
+            ok = true;
+        } finally {
+            try {
+                os.close();
+            } catch (Exception ignored) {
+            }
+            if (Build.VERSION.SDK_INT >= 29) {
+                if (ok) {
+                    ContentValues v = new ContentValues();
+                    v.put(MediaStore.Video.Media.IS_PENDING, 0);
+                    cr.update(outUri, v, null, null);
+                } else {
+                    try {
+                        cr.delete(outUri, null, null);
+                    } catch (Exception ignored) {
+                    }
+                }
+            } else if (!ok) {
+                try {
+                    new File(outUri.getPath()).delete();
+                } catch (Exception ignored) {
+                }
+            }
+        }
+        return outUri;
+    }
+
+    // ------------------------------------------------------------------
+    // Modo 1: união rápida, sem recodificar (MediaExtractor + MediaMuxer)
+    // ------------------------------------------------------------------
 
     private static int findTrack(MediaExtractor ex, String prefix) {
         for (int i = 0; i < ex.getTrackCount(); i++) {
@@ -253,7 +492,8 @@ public class MainActivity extends Activity {
 
     private void merge(List<Uri> in) throws Exception {
         ContentResolver cr = getContentResolver();
-        String fileName = "Unido_" + new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date()) + ".mp4";
+        String fileName = newName();
+        final String dica = " Marque a opção \"Recodificar\" e tente de novo.";
 
         Uri outUri;
         ParcelFileDescriptor outPfd;
@@ -334,14 +574,14 @@ public class MainActivity extends Activity {
                         if (!vMime.equals(vf.getString(MediaFormat.KEY_MIME))
                                 || vW != vf.getInteger(MediaFormat.KEY_WIDTH)
                                 || vH != vf.getInteger(MediaFormat.KEY_HEIGHT)) {
-                            throw new Exception("o vídeo " + (i + 1) + " tem codec ou resolução diferente do primeiro");
+                            throw new Exception("o vídeo " + (i + 1) + " tem codec ou resolução diferente do primeiro." + dica);
                         }
                         if (hasAudio) {
-                            if (af == null) throw new Exception("o vídeo " + (i + 1) + " não tem áudio, mas o primeiro tem");
+                            if (af == null) throw new Exception("o vídeo " + (i + 1) + " não tem áudio, mas o primeiro tem." + dica);
                             if (!aMime.equals(af.getString(MediaFormat.KEY_MIME))
                                     || aSr != intOr(af, MediaFormat.KEY_SAMPLE_RATE, aSr)
                                     || aCh != intOr(af, MediaFormat.KEY_CHANNEL_COUNT, aCh)) {
-                                throw new Exception("o áudio do vídeo " + (i + 1) + " tem formato diferente do primeiro");
+                                throw new Exception("o áudio do vídeo " + (i + 1) + " tem formato diferente do primeiro." + dica);
                             }
                         }
                     }
